@@ -1,0 +1,9 @@
+pyVisa
+pyUSB
+pyvisa-py
+libusb
+pyserial
+psutil
+zeroconf
+PyVICP
+pyserial
