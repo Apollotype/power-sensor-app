@@ -24,7 +24,7 @@ except Exception as e:
 
 # ===== Настройки =====
 DEFAULT_BACKENDS = ["@py", ""]   # сперва pyvisa-py (без NI), затем системный VISA (если вдруг есть)
-POLL_PERIOD_S = 0.5
+POLL_PERIOD_S = 5
 READ_TERM = "\n"
 WRITE_TERM = "\n"
 
