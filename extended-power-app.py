@@ -11,6 +11,8 @@ PowerMeter GUI (PyVISA, tkinter) с автообнаружением USBTMC:
 import threading, queue, time, re, sys
 from typing import Optional, List
 import tkinter.font as tkfont
+import threading, re
+
 
 
 try:
@@ -22,7 +24,7 @@ except Exception as e:
 
 # ===== Настройки =====
 DEFAULT_BACKENDS = ["@py", ""]   # сперва pyvisa-py (без NI), затем системный VISA (если вдруг есть)
-POLL_PERIOD_S = 0.3
+POLL_PERIOD_S = 0.5
 READ_TERM = "\n"
 WRITE_TERM = "\n"
 
@@ -45,11 +47,22 @@ except Exception as e:
 
 
 # ===== Вспомогательные =====
-def parse_float(text: str) -> Optional[float]:
-    if text is None:
+_UNIT = {"hz": 1.0, "khz": 1e3, "mhz": 1e6, "ghz": 1e9}
+
+def parse_float(text: str):
+    """Достаёт число из строки + применяет суффиксы Hz/kHz/MHz/GHz.
+    НИЧЕГО не делает с dBm — просто вернёт число как есть."""
+    if not text:
         return None
-    m = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", text.strip())
-    return float(m.group(0)) if m else None
+    t = str(text).strip()
+    m = re.search(r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([a-zA-Z]+)?', t)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit in _UNIT:
+        val *= _UNIT[unit]
+    return val
 
 def scan_usb_usbtmc(backends: List[str]) -> List[str]:
     """Сканируем ТОЛЬКО USBTMC (USB?*::INSTR) по нескольким бэкендам и объединяем без дублей."""
@@ -73,51 +86,75 @@ def scan_usb_usbtmc(backends: List[str]) -> List[str]:
 
 # ===== Класс прибора =====
 class VisaMeter:
-    def __init__(self, backend_order: List[str]):
+    def __init__(self, backend_order):
         if not HAS_VISA:
-            raise RuntimeError("pyvisa не установлен")
+            raise RuntimeError("PyVISA не установлен")
         self.backend_order = backend_order
         self.rm = None
         self.inst = None
+        self.resource = None
         self.backend_in_use = None
+        self._lock = threading.RLock()
+
+    def _close_unlocked(self):
+        if self.inst:
+            try:
+                self.inst.close()
+            except Exception:
+                pass
+        self.inst = None
+        self.rm = None
         self.resource = None
 
-    def connect(self, resource: str) -> None:
-        last_err = None
-        for be in self.backend_order:
-            try:
-                rm = pyvisa.ResourceManager(be) if be else pyvisa.ResourceManager()  # важно: без None
-                inst = rm.open_resource(resource)
-                inst.read_termination = READ_TERM
-                inst.write_termination = WRITE_TERM
-                inst.timeout = 5000
-                self.rm = rm
-                self.inst = inst
-                self.backend_in_use = be
-                self.resource = resource
-                return
-            except Exception as e:
-                last_err = e
-        raise last_err if last_err else RuntimeError("Не удалось подключиться")
+    def is_connected_to(self, resource: str) -> bool:
+        return self.inst is not None and self.resource == resource
 
-    def close(self) -> None:
-        try:
-            if self.inst:
-                self.inst.close()
-        finally:
-            self.inst = None
-            self.rm = None
-            self.resource = None
+    def connect(self, resource: str, timeout_ms: int = 5000):
+        """Идемпотентный connect: повтор на тот же ресурс — просто ОК."""
+        with self._lock:
+            if self.is_connected_to(resource):
+                return
+            # закрыть предыдущее соединение, если было
+            self._close_unlocked()
+
+            # выбрать первый доступный бэкенд
+            last_err = None
+            for be in self.backend_order:
+                try:
+                    self.rm = pyvisa.ResourceManager(be) if be else pyvisa.ResourceManager()
+                    self.inst = self.rm.open_resource(resource)
+                    self.inst.timeout = timeout_ms
+                    self.inst.read_termination = "\n"
+                    self.inst.write_termination = "\n"
+                    try:
+                        self.inst.clear()   # очистим буферы на всякий
+                    except Exception:
+                        pass
+                    self.backend_in_use = be or "default"
+                    self.resource = resource
+                    return
+                except Exception as e:
+                    last_err = e
+                    self.rm = None
+                    self.inst = None
+            raise last_err or RuntimeError("Не удалось открыть ресурс")
+
+
+    def close(self):
+        with self._lock:
+            self._close_unlocked()
 
     def query(self, cmd: str) -> str:
-        if not self.inst:
-            raise RuntimeError("Не подключено")
-        return self.inst.query(cmd)
+        with self._lock:
+            if not self.inst:
+                raise RuntimeError("Нет соединения")
+            return self.inst.query(cmd)
 
-    def write(self, cmd: str) -> None:
-        if not self.inst:
-            raise RuntimeError("Не подключено")
-        self.inst.write(cmd)
+    def write(self, cmd: str):
+        with self._lock:
+            if not self.inst:
+                raise RuntimeError("Нет соединения")
+            return self.inst.write(cmd)
 
     def idn(self) -> str:
         try:
@@ -297,14 +334,21 @@ class App(tk.Tk):
     def on_connect(self):
         res = self.res_entry.get().strip()
         if not res:
-            messagebox.showwarning("Power Meter", "Введите строку ресурса (USB0::...::INSTR).")
+            messagebox.showwarning("Power Meter", "Введите USB-адрес ресурса (USB0::...::INSTR).")
             return
+
+    # если мы уже на этом ресурсе — просто ничего не делаем
+        if self.meter.is_connected_to(res):
+            self.status.configure(text=f"Already connected: {res}")
+            return
+
+    # на другой ресурс — аккуратно перезапустим опрос
         self._stop_polling()
         try:
             self.meter.connect(res)
             self.backend_label.configure(text=self.meter.backend_in_use or "default")
-            idn = self.meter.idn()
-            self.status.configure(text=f"Connected: {res}{(' | IDN: ' + idn.strip()) if idn else ''}")
+            idn = self.meter.idn().strip()
+            self.status.configure(text=f"Connected: {res}{(' | ' + idn) if idn else ''}")
             self.peak_value = None
             self.lbl_peak.configure(text="—")
             self._start_polling()
@@ -335,11 +379,14 @@ class App(tk.Tk):
     def on_set_freq(self):
         val = self.ent_freq.get().strip()
         if not val:
-            messagebox.showwarning("Set Freq", "Введите частоту (Гц).")
+            messagebox.showwarning("Set Freq", "Введите частоту, можно с суффиксом (Hz/kHz/MHz/GHz).")
             return
         try:
-            self.meter.write(SCPI_SET_FREQ.format(freq=val))
-            self.status.configure(text=f"Freq set: {val}")
+            hz = parse_float(val)
+            if hz is None:
+                raise ValueError(f"Не удалось распознать частоту: {val}")
+            self.meter.write(SCPI_SET_FREQ.format(freq=int(hz)))
+            self.status.configure(text=f"Freq set: {val} → {int(hz)} Hz")
         except Exception as e:
             self.status.configure(text=f"Freq set error: {e}")
             messagebox.showerror("Freq set error", str(e))

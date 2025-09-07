@@ -7,3 +7,5 @@ psutil
 zeroconf
 PyVICP
 pyserial
+threading
+pe
