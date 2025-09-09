@@ -7,3 +7,4 @@ psutil
 zeroconf
 PyVICP
 pyserial
+python_ivi
