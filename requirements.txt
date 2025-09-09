@@ -7,4 +7,6 @@ psutil
 zeroconf
 PyVICP
 pyserial
-python_ivi
+"python-ivi @ git+https://github.com/python-ivi/python-ivi.git"
+numpy
+python-vxi11
